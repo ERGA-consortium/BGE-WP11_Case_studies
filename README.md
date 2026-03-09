@@ -1,6 +1,6 @@
 # Biodiversity Genomics Europe (BGE) Case studies 
 # Project description 
-This repository contains the complete set of scripts used in the 20 case studies subcontracted by the SIB Swiss Institute of Bioinformatics (Lausanne, Switzerland, https://www.sib.swiss/) under the Biodiversity Genomics Europe (BGE) project (https://biodiversitygenomics.eu/). 
+This repository contains the complete set of scripts used in the XX case studies subcontracted by Cibio - Universidade do Porto (Portugal, https://www.cibio.up.pt/en/) under the Biodiversity Genomics Europe (BGE) project (https://biodiversitygenomics.eu/). 
 
 Each folder in the repository represents an individual case study. Each folder name follows this format:
 
@@ -11,12 +11,11 @@ Example:
 Antwerp_University-Knipowitschia_panizzae
 
 # Help & Support
-If you encounter issues or need support, either submit a request or contact chiara[dot]bortoluzzi[at]sib[dot]swiss and christian[dot]deguttry[at]sib[dot]swiss.
+If you encounter issues or need support, either submit a request or contact chiara[dot]bortoluzzi[at]sib[dot]swiss and jpimenta[at]cibio[dot]up[dot]pt
 
 # Authors 
 Chiara Bortoluzzi, Data Manager, Environmental Bioinformatics Group, SIB Swiss Institute of Bioinformatics, Switzerland
-Christian de Guttry, Project Manager, Environmental  Bioinformatics Group, SIB Swiss Institute of Bioinformatics, Switzerland
-Robert Waterhouse, Director, Environmental Bioinformatics Group, SIB Swiss Institute of Bioinformatics, Switzerland
+João Pimenta, Cibio, Portugal
 
 # Version History
 0.1: Initial Release

@@ -1,6 +1,6 @@
 # Biodiversity Genomics Europe (BGE) Case studies 
 # Project description 
-This repository contains the complete set of scripts used in the 9 case studies subcontracted by Cibio - Universidade do Porto (Portugal, https://www.cibio.up.pt/en/) under the Biodiversity Genomics Europe (BGE) project (https://biodiversitygenomics.eu/). 
+This repository contains the complete set of scripts used in the 9 case studies developed under the Biodiversity Genomics Europe (BGE) project (https://biodiversitygenomics.eu/). 
 
 Each folder in the repository represents an individual case study. Each folder name follows this format:
 

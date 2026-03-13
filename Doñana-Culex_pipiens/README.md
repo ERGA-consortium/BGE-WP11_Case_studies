@@ -1,4 +1,4 @@
-# Title of the case study
+# Population genomics of Culex pipiens and Culex perexiguus
 This repository includes all files and scripts used to analyze the whole genome re-sequencing data of the BGE case study focused on Culex pipiens and Culex perexiguus
 
 # Authors 

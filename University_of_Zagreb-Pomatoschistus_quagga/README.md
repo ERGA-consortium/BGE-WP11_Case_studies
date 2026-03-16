@@ -1,10 +1,8 @@
-# Title of the case study
-This repository includes all the scripts used to [specify here the reason: taken from Notion].
+# Uncovering the rapid diversification and evolution of highly endemic Mediterranean freshwater fishes (gobies)
+This repository includes all the scripts used to analyse the rapid diversification and evolution of highly endemic Mediterranean freshwater fishes (gobies).
 
 # Authors 
-[Name of applicant], [Affiliation], [Address of affiliation], [Country]
-
-[Name of applicant], [Affiliation], [Address of affiliation], [Country]
+Lucija Novoselec, Faculty of Science, University of Zagreb, Rooseveltov trg 6, 10 000 Zagreb, Croatia
 
 # Acknowledgements
 This work was supported by Cibio under the Biodiversity Genomics Europe project.

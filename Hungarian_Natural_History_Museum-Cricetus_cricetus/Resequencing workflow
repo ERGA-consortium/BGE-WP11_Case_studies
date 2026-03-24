@@ -1,0 +1,236 @@
+#filter the raw reads
+for i in $samples
+do fastp -i ./raw/${i}.1.fq.gz -I ./raw/${i}.2.fq.gz -o ./fastp_samples/${i}_f.1.fq.gz -O ./fastp_samples/${i}_f.2.fq.gz -g -q 20 -u 50 -n 15 --detect_adapter_for_pe -w 10 -c -f 10 -F 10 -h ./fastp_samples/${i}_f.html -j ./fastp_samples/${i}_f.json
+done
+
+#map to the reference
+bwa mem -t 20 -R "@RG\tID:$i\tSM:$i\tPL:Illumina" ./reference/mCriCri2.nextdenovo.assembly.hypo1.purged.fa.gz ./filtered_corrected/${i}.1.fq_corrected.fastq.gz ./filtered_corrected/${i}.2.fq_corrected.fastq.gz | samtools view -h -b -@ 20 | samtools sort -@ 20 -o ./bam/${i}.bam
+
+#define the list of bam file names as a local variable
+bams=$(ls *.bam | cut -f 1 -d "_" | sort | uniq)
+echo $bams #if you want to check the list
+
+#in this step, we use 'picard CleanSam' to clean soft-clipping beyond-end-of-reference alignments and setting MAPQ to 0 for unmapped reads
+for i in $bams
+>do echo "picard CleanSam -I ~<inpath>/${i}_f.bam -O <out_path>/${i}_f_c.bam"
+>done | parallel -j 20
+
+#next, we need to sort the bam files (which are, BTW, already sorted by coordinates) according to their name, because this must be the input sorting for the next step
+#if you are uncertain how your bam files are sorted you can run a simple command to check
+samtools view -H your_file.bam | grep SO
+#now, the actual code for re-sorting
+for i in $bams
+>do echo sambamba sort -n -t 20 -o ./sort_bam/${i}_f_c_s.bam ./c_bam/${i}_f_c.bam
+>done
+
+#we now can fix paried-mates with 'samtools fixmate' that fills in mate coordinates and insert size fields
+for i in $bams
+>do echo "samtools fixmate -@ 1 ./sort_bam/${i}_f_c_s.bam ./fixed_bam/${i}_f_c_s_fixed.bam
+>done | parallel -j 20
+
+#for the next filtering steps, we need to sort them back by coordinate
+for i in $bams
+>do echo "samtools sort -@ 1 -o ./coord_bam/${i}_f_c_s_f_coord.bam ./fixed_bam/${i}_f_c_s_fixed.bam && samtools index ./coord_bam/${i}_f_c_s_f_coord.bam"
+>done | parallel -j 20
+
+#we will now remove secondary alignments by using samtools flag combination '-F 256' ("not primary alignment")
+for i in $bams
+>do echo "samtools view -@ 1 -bh -F 256 ./coord_bam/${i}_f_c_s_f_coord.bam . > ./prim_bam/${i}_f_c_s_f_c_prim.bam"
+>done | parallel -j 20
+
+#at this stage, we can mark duplicates
+for i in $bams
+>do sambamba markdup -t 20 ./prim_bam/${i}_f_c_s_f_c_prim.bam ./dupl_bam/${i}_f_c_s_f_c_p_d.bam --overflow-list-size 1200000 &> ./dupl_bam/duplicates_${i}.log
+>done
+
+#we need to create a sequence dictionary for additional, downstream analyses
+picard CreateSequenceDictionary -R ./reference/mCriCri2.nextdenovo.assembly.hypo1.purged.fasta -O ./dict/mCriCri2.nextdenovo.assembly.hypo1.purged.dict -SP cricetus_cricetus
+
+#we are using the above dictionary now to reorder the reads according to the position in the reference genome
+for i in $bams
+>do picard ReorderSam -I ./dupl_bam/${i}_f_c_s_f_c_p_d.bam -O ./reord_bam/${i}_final.bam -R ./reference/mCriCri2.nextdenovo.assembly.hypo1.purged.fasta --SEQUENCE_DICTIONARY ./dict/mCriCri2.nextdenovo.assembly.hypo1.purged.dict
+>done
+
+#check on bam quality using Qualimap
+for i in $bams
+>do qualimap bamqc -bam ${i}_final.bam -c -outdir ${i} -nt 16 --java-mem-size=96g
+>done
+
+#check if read-group information is available as it will be necessary in the next steps
+samtools view -H <infile>.bam | grep ^@RG
+
+#if the readgroup information is missing, we need to add it now with picard-tools
+for i in $bams
+>do echo "picard AddOrReplaceReadGroups -I ${i}.bam -O ${i}.rg.bam --RGID 1 --RGLB lib1 --RGPL ILLUMINA --RGPU unit1 --RGSM ${i}"
+>done | parallel -j 6
+
+#we need to index the files again, if the header information was missing
+for i in $bams
+>do echo "samtools index ${i}.re.bam"
+>done | parallel -j 20
+
+#we can call SNPs in each sample by GATK4
+for i in $bams
+>do gatk HaplotypeCaller -R ./reference/mCriCri2.nextdenovo.assembly.hypo1.purged.fasta -I ./reord_bam/${i}.rg.bam -O ./gatk4/${i}.vcf.gz -ERC GVCF &> ./gatk4/${i}_snpcall.log
+>done
+#this produces a number of vcf.gz files that we need to combine for a population level inference
+
+#combining individual vcf.gz files
+gatk CombineGVCFs -R ./reference/mCriCri2.nextdenovo.assembly.hypo1.purged.fasta -O ./gatk4/cricetus.combined.vcf.gz $(for f in ./gatk4/*.vcf.gz; do echo -V "$f"; done) #this latter for loop simply lists all samples
+
+#We now will convert the GVCF (which includes genotype likelihoods and variant calls per sample) into a fully genotyped multisample VCF, suitable for downstream filtering and population genomics.
+gatk GenotypeGVCFs -R ./reference/mCriCri2.nextdenovo.assembly.hypo1.purged.fasta -V cricetus.combined.vcf.gz -O cricetus.genotyped.vcf.gz --include-non-variant-sites
+
+#finally, it is important to remove those vcf lines that does not contain SNPs (i.e., they contain indels or no data)
+bcftools view -v snps cricetus.genotyped.vcf.gz > snps.cricetus.genotyped.vcf
+
+#an alternative option: SNP and haplotype calling using freebayes in a single step
+freebayes -f ./reference/mCriCri2.nextdenovo.assembly.hypo1.purged.fasta -L bamlist -m 5 -q 20 -E 3 --min-repeat-entropy 1 -V --populations popmap.list -n 5 -v ./freebayes/freebayes.snps.vcf
+ 
+vctools --vcf freebayes.snps.vcf --max-missing 0.8 --remove-indv CC125 --min-alleles 2 --max-alleles 2 --remove-indels --out miss20.bi.snps.freebayes
+
+mawk '!/#/' miss20.bi.snps.freebayes.recode.vcf
+17875718
+
+#filtering for minGQ>30
+vcftools --vcf miss20.bi.snps.freebayes.recode.vcf --minGQ 30 --recode --recode-INFO-all --out miss20.bi.snps.minGQ30.freebayes
+After filtering, kept 17875718 out of a possible 17875718 Sites
+
+#we now need to replace all accidentally remaining values in all sample data with missing genotype field (e.g., ./.:3,0:0:3:0,9,112:0:120:3) - that can be called "“inconsistent missing genotypes" - to flat missing data: "./.:.:.:.:.:.:.:."
+#Actually, we can check the presence f such inconsistent missing genotype fields by the following code:
+ awk '!/^#/ {
+  for(i=10;i<=NF;i++){
+    split($i,a,":");
+    if(a[1]=="./.") {
+      for(j=2;j<=length(a);j++){
+        if(a[j]!=".") {print "Line " NR ": Sample column " i " has missing GT but non-missing fields"; break}
+      }
+    }
+  }
+}' <input>.vcf
+
+#If it is necessary, we can run the script below
+grep "^#" miss20.bi.snps.minGQ30.freebayes.recode.vcf > miss20.bi.snps.minGQ30.dp0.freebayes.vcf
+grep -v "^#" miss20.bi.snps.minGQ30.freebayes.recode.vcf | awk '{printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t", $1,$2,$3,$4,$5,$6,$7,$8,$9; for(i=10;i<=NF;i++){ split($i,a,":"); if(i<NF){ if(a[1]=="./.") printf "%s\t", a[1]":.:.:.:."; else printf "%s\t",$i } else { if(a[1]=="./.") printf "%s\n", a[1]":.:.:.:."; else print $i}}}' >> miss20.bi.snps.minGQ30.dp0.freebayes.vcf
+
+#mean depth per individual
+vcftools --vcf miss20.bi.snps.minGQ30.freebayes.recode.vcf --depth --recode-INFO-all --out depth.miss20.bi.snps.minGQ30.freebayes
+
+#mean read depth across samples for each site
+vcftools --vcf miss20.bi.snps.minGQ30.freebayes.recode.vcf --site-mean-depth --out site.miss20.bi.snps.minGQ30.freebayes
+
+#we extract now basic statistics of mean site depth values
+awk 'NR==1 && $1=="CHROM"{next} {if(!seen){min=max=$3+0; seen=1} if($3+0<min) min=$3+0; if($3+0>max) max=$3+0} END{print "Min:",min,"\nMax:",max}' site.miss20.bi.snps.minGQ30.freebayes.ldepth.mean
+Min: 1.51852
+Max: 4360.23
+awk 'NR>1 {print $3}' site.miss20.bi.snps.minGQ30.freebayes.ldepth.mean | sort -n > site.depth.sorted.list
+N=$(wc -l < site.depth.sorted.list)
+median_pos=$(( (N+1)/2 ))
+p1_pos=$(( (N*1 + 99)/100 ))   # ceil(N*0.01)
+p99_pos=$(( (N*99)/100 ))      # floor(N*0.99)
+median=$(sed -n "${median_pos}p" site.depth.sorted.list)
+3.96296
+p1=$(sed -n "${p1_pos}p" site.depth.sorted.list)
+2.85714
+p99=$(sed -n "${p99_pos}p" site.depth.sorted.list)
+81.9429
+
+#now, we apply the filters
+GMIN=3           # per-genotype minimum depth
+GMAX=82      # per-genotype maximum depth (or based on your 99th pct / 3× rule)
+SMIN=3            # per-site mean depth minimum
+SMAX=12         # per-site mean depth maximum
+bcftools +setGT miss20.bi.snps.minGQ30.freebayes.recode.vcf -- -t q -n . -i "FMT/DP<${GMIN} || FMT/DP>${GMAX}" > step1.maskedGT.vcf
+bgzip -c step1.maskedGT.vcf > step1.maskedGT.vcf.gz
+tabix -f step1.maskedGT.vcf.gz
+
+#Now you remove the ‘extreme’ sites after masking:
+bcftools view -i "AVG(FMT/DP)>=${SMIN} && AVG(FMT/DP)<=${SMAX}" step1.maskedGT.vcf.gz -Oz -o step2.depthSites.vcf.gz
+tabix -f step2.depthSites.vcf.gz
+# Summary stats
+bcftools stats step2.depthSites.vcf.gz > stats.txt
+plot-vcfstats --no-PDF -p stats_plots stats.txt
+
+#filter for hwe and maf
+vcftools --gzvcf step2.depthSites.vcf.gz --maf 0.05 --hwe 0.05 --recode --recode-INFO-all --out step3.maf01.hwe005
+
+#LD pruning
+#first, we need to chenge SNP-ID structure
+ awk 'BEGIN{OFS="\t"} /^#/ {print} !/^#/ {chrom=$1; pos=$2; $1="1"; $3=chrom"_"pos; print}' step3.maf005.hwe005.recode.vcf > step3.maf005.hwe005.fixed.vcf
+plink2 --vcf step3.maf01.hwe005.fixed.vcf --make-bed --allow-extra-chr --out step3
+plink2 --bfile step3 --allow-extra-chr --indep-pairwise 50 5 0.25 --bad-ld --out step3_LDprune
+plink2 --bfile step3 --extract step3_LDprune.prune.in --make-bed --allow-extra-chr --out step3_LDpruned
+#quick check of PCA
+plink2 --bfile step3_LDpruned --freq --allow-extra-chr --out step3_LDprune
+plink2 --bfile step3_LDpruned --read-freq step3_LDprune.afreq --pca 20 --allow-extra-chr --out step3_LDpruned_PCA
+
+#now write out a vcf with only those SNPs that are LD pruned
+awk '{if($2==".") $2=$1"\t"$4; print $2}' step3_LDpruned.bim > snplist.tsv
+vcftools --vcf step3.maf01.hwe005.recode.vcf --positions snplist.tsv --recode --recode-INFO-all --out step4.maf01.hwe005.LDpruned
+
+#alternative way to start from our filtered freebayes vcf
+awk 'BEGIN{OFS="\t"} /^#/ {print} !/^#/ {chrom=$1; pos=$2; $1="1"; $3=chrom"_"pos; print}' miss20.bi.snps.minGQ30.freebayes.recode.vcf > miss20.bi.snps.minGQ30.freebayes.fixed.vcf
+
+plink2 --vcf miss20.bi.snps.minGQ30.freebayes.fixed.vcf --make-bed --allow-extra-chr --sort-vars --out freebayes.filt
+plink2 --bfile freebayes.filt --allow-extra-chr --indep-pairwise 50 5 0.25 --bad-ld --out freebayes.filt_LDprune
+plink2 --bfile freebayes.filt --extract freebayes.filt_LDprune.prune.in --make-bed --allow-extra-chr --out freebayes.filt_LDpruned
+plink2 --bfile freebayes.filt_LDpruned --freq --allow-extra-chr --out freebayes.filt_LDpruned
+plink2 --bfile freebayes.filt_LDpruned --read-freq freebayes.filt_LDpruned.afreq --pca 20 --allow-extra-chr --out freebayes.filt_LDpruned_PCA
+
+awk '{if($2==".") $2=$1"\t"$4; print $2}' freebayes.filt_LDpruned.bim > snplist.tsv
+vcftools --vcf miss20.bi.snps.minGQ30.freebayes.fixed.vcf --snps snplist.tsv --recode --recode-INFO-all --out miss20.bi.snps.minGQ30.LDpruned.freebayes
+vcftools --vcf miss20.bi.snps.minGQ30.LDpruned.freebayes.recode.vcf --hwe 0.05 --maf 0.05 --recode --recode-INFO-all --out miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.freebayes
+After filtering, kept 1255923 out of a possible 6152704 Sites
+
+vcftools --vcf miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.freebayes.recode.vcf --min-meanDP 2.8 --max-meanDP 82 --recode --reode-INFO-all --out miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.meanDP.freebayes
+After filtering, kept 1118511 out of a possible 1255923 Sites
+
+plink2 --vcf miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.meanDP.freebayes.recode.vcf --make-bed --allow-extra-chr --out final.freebayes
+plink2 --bfile final.freebayes --freq --allow-extra-chr --out final.freebayes
+plink2 --bfile final.freebayes --read-freq final.freebayes.afreq --pca 20 --allow-extra-chr --out final.freebayes_PCA
+
+~/vcf2phylip/vcf2phylip.py -i miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.meanDP.freebayes.recode.vcf -n -f
+cp *.phy ./iqtree/.
+iqtree -s miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.meanDP.freebayes.recode.vcf.min4.phy -st DNA -nt 6 -m MFP+ASC -alrt 1000 -bb 1000
+#Invalid use of +ASC because of 399622 invariant sites in the alignment.  For your convenience alignment with variable sites printed to final.freebayes.varsites.phy
+iqtree -st DNA -s final.freebayes.varsites.phy -m MFP+ASC -nt 6 -alrt 1000 -bb 1000 -pre final.var.freebayes
+
+#we worked in R to select SNPs putatively under selection using the R package pcadapt
+#make new datasets based on neutral and selective SNPs
+vcftools --vcf miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.meanDP.freebayes.recode.vcf --snps selection.loci --recode --recode-INFO-all --out selection_cricetus_reseq
+vcftools --vcf miss20.bi.snps.minGQ30.LDpruned.hwe005.maf005.meanDP.freebayes.recode.vcf --exclude selection.loci --recode --recode-INFO-all --out neutral_cricetus_reseq
+
+#first, is to calculate observed heterozygosity in the neutral dataset
+bcftools stats -S region.indv.list.txt neutral_cricetus_reseq.recode.vcf > bcfstats.log
+cat bcfstats.log | grep "PSC"
+
+#heerzygosity clculations in vcftools
+pops=$(ls | cut -f 1 -d "." | sort -n | uniq)
+echo $pops
+agricultural balmazujvaros csorna Dttul gara kisalfold lesser mezoseg poroszlo tkeszi Ttul urban vienna
+for i in $pops ; do vcftools --vcf neutral_cricetus_reseq.recode.vcf --keep ./poplists/${i}.txt --het --out ./heterozygosities/${i}; done
+
+#compute Hₒ and Hₑ manually: Expected heterozygosity = 1 - E(HOM)/N_SITES; Observed heterozygosity = 1 - O(HOM)/N_SITES
+awk 'NR>1 {Hexp=1-$3/$4; Hobs=1-$2/$4; print $1, Hobs, Hexp}' ${i}.het > ${i}_het_individual.log
+echo -e "INDV\tHobs\tHexp" > header
+for i in $pops ; do cat header ${i}_het_individual.log > ${i}_het_individuals.report; done
+
+#gwas for agricultral vs urban
+king -b final.freebayes.bed --kinship --prefix kinship_neutral #first we make a kinship table
+python king2gemma.py #this turns the output of KING into a matrix readable by gemma
+#here, we provided two text files that contain information abot the individuals according to the list of them in the final.freebayes.fam file: hamster_geo.cov & hamster.pheno
+gemma -bfile final.freebayes -k ./king/kinship_for_gemma.txt -c ./king/hamster_geo.cov -p ./king/hamster.pheno -lmm 4 -o ./gwas
+#post processing files
+awk 'NR>1' gwas.assoc.txt | sort -k13,13g | head -n 10 #list the 10 most significantly associated SNPs
+# Bonferroni threshold for 358052 SNPs
+threshold=$(echo "0.05 / 358052" | bc -l)   # ~1.396e-07
+# Print header
+head -n 1 gwas.assoc.txt > gwas.significant.txt
+# Filter SNPs below threshold
+awk -v t=$threshold 'NR>1 && $13 < t' gwas.assoc.txt >> gwas.significant.txt
+cat gwas.significant.txt
+chr     rs      ps      n_miss  allele1 allele0 af      beta    se      logl_H1 l_remle l_mle   p_wald  p_lrt   p_score
+1       ctg007320_1_90798       90798   0       T       A       0.214   -6.432082e-01   9.548292e-02    5.268018e+00    1.000000e+05    1.000000e+05    1.311325e-07    2.710937e-08    7.732774e-05
+
+#change back to real contig ID from false "1" one:
+awk 'NR==1 {print $0; next} {split($2,a,"_"); chr=""; for(i=1;i<length(a);i++){chr=(i==1)?a[i]:chr"_"a[i]}; $1=chr; print}' gwas.assoc.txt > gwas.assoc.corrected.txt

@@ -1,0 +1,80 @@
+#demultiplexing the raw reads
+cd raw
+batches=$(ls *.1.fq.gz | cut -f 2,3 -d "_" | cut -f 1 -d "." | sort -n)
+echo $batches
+cd ..
+for i in $batches ; do echo "process_radtags -1 ./raw/cricetusRAD3_${i}.1.fq.gz -2 ./raw/cricetusRAD3_${i}.2.fq.gz -o ./samples -b map${i} -e sbfI -E phred33 -r -c -q --inline_null -t 140 --len_limit 140 > ./samples/cricetusRAD3_${i}_demultiplex.log"; done | parallel -j 18
+cd samples/
+rm *rem*
+
+#quality check by fastqc
+mkdir fastqc
+fastqc -t 16 28894_22_10.1.fq.gz CCM44_25_9.1.fq.gz -o ./fastqc/.
+fastqc -t 16 28894_22_10.2.fq.gz CCM44_25_9.2.fq.gz -o ./fastqc/.
+cd ..
+
+#quality filtering and trimming
+samples=$(ls *.1.fq.gz | cut -f 1 -d "." | sort -n | uniq)
+echo $samples
+cd ..
+for i in $samples ; do echo "fastp -i ./samples/${i}.1.fq.gz -I ./samples/${i}.2.fq.gz -o ./trim_samples/${i}.1.fq.gz -O ./trim_samples/${i}.2.fq.gz -F 10 -g --detect_adapter_for_pe -h ./logs/${i}_fastp.html -j ./logs/${i}_fastp.json"; done | parallel -j 8
+
+#mapping to the reference (index it with bwa index if that is not done)
+for i in $samples
+do bwa mem -R $'@RG\tID:'$i$'\tSM:'$i$'\tPL:Illumina' -t 20 ./reference/<ref>.fna.gz ./trim_samples/${i}.1.fq.gz ./trim_samples_2cut/${i}.2.fq.gz | samtools view -h -b -@ 20 | samtools sort -@ 20 -o ./bam/${i}.bam
+done
+
+#mark duplicate reads in bam files
+for i in $samples
+do echo "sambamba markdup -t 1 ./bam/${i}.bam ./d_bam/${i}d.bam &> ./logs/duplicates_${i}.log"
+done | parallel -j 22
+
+#move those old bams that were re-done to another place
+mkdir ../redone_dbams
+xargs -a redone_bams.txt mv -t ../redone_dbams/.
+
+#call SNPs and indels with freebayes
+freebayes -f ./reference/mCricri*.fasta -L bamlist123 -m 20 -q 20 -E 3 --min-repeat-entropy 1 -V --populations popmap123 -n 5 -v ./freebayes/freebayes.snps.vcf
+
+#we made some important filtering for imiss, nohighmiss, maf0.075, and bi
+vcftools --vcf freebayes.snps.vcf --max-missing 1.0 --missing-site 0.9 --maf 0.075 --min-alleles 2 --max-alleles 2 --remove highimiss.list --recode --recode-INFO-all --out  noimiss.miss10.maf0075.bi
+#calculating TajimaD per RAD locus
+vcftools --vcf noimiss.miss10.maf0075.bi.recode.vcf --site-pi --out pi_sites
+awk 'NR>1{print $1,$2}' pi_site.sites.pi > SNP_positions_filtered.txt
+vcftools --vcf noimiss.miss10.maf0075.bi.recode.vcf --TajimaD 1 --remove repeat.exclude.indv.list --out tajima_site
+#this will produce a very, very large list because vcftools each virtual position on the reference genome and will print "nan" to those places where there is no SNP... So, it is better to filter after the calculations are over, and delete the very large file.
+
+awk 'NR==FNR{ok[$1":"$2]; next} ($1":"$2) in ok {print $0}' SNP_positions_filtered.txt tajima_site.Tajima.D > tajima_site_filtered.D
+
+#aggregate by 900bp (i.e., the likely max length of the RAD loci, and calculate mean TajimaD value for loci >=2 SNPs
+MAX_LEN=900
+awk -v MAX_LEN=$MAX_LEN 'BEGIN{OFS="\t"; print "CHROM","START","END","N_SNP","mean_TajimaD"}
+NR>1 {
+    chrom=$1; pos=$2; D=$4
+    if(D=="nan" || D=="NaN" || D==".") next
+    if(chrom!=prev_chrom || pos-prev_end>MAX_LEN){
+        if(prev_chrom!="" && count>=2){
+            mean=sum/count
+            print prev_chrom,locus_start,prev_end,count,mean
+        }
+        locus_start=pos
+        sum=D; count=1
+    } else {
+        sum+=D; count++
+    }
+    prev_chrom=chrom
+    prev_end=pos
+}
+END{
+    if(prev_chrom!="" && count>=2){
+        mean=sum/count
+        print prev_chrom,locus_start,prev_end,count,mean
+    }
+}' tajima_site_filtered.D > TajimaD_per_RAD_locus.tsv
+
+#calculate mean TajimaD for RADloci with >8 SNPs
+awk 'NR>1 && $4>8 {sum+=$5; n++} 
+END{
+    if(n>0) printf "Mean TajimaD (N_SNP>8): %.5f (%d loci)\n", sum/n, n
+    else print "No loci found with N_SNP>8"
+}' TajimaD_per_RAD_locus.tsv
